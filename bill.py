@@ -120,6 +120,41 @@ def get_db():
 
 def init_db():
     db = get_db()
+    # Check if migration needed (old schema has CHECK on source)
+    old_schema = db.execute(
+        "SELECT sql FROM sqlite_master WHERE name='transactions'"
+    ).fetchone()
+    needs_migration = old_schema and "CHECK(source IN" in (old_schema[0] or "")
+
+    if needs_migration:
+        # Recreate table without source CHECK constraint
+        db.executescript("""
+            CREATE TABLE transactions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('expense','income','neutral')),
+                category TEXT NOT NULL DEFAULT '其他',
+                merchant TEXT DEFAULT '',
+                product TEXT DEFAULT '',
+                source TEXT NOT NULL,
+                payment_method TEXT DEFAULT '',
+                tx_id TEXT DEFAULT '',
+                remark TEXT DEFAULT '',
+                is_duplicate INTEGER DEFAULT 0,
+                dup_of INTEGER DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                UNIQUE(date, amount, merchant, source)
+            );
+            INSERT INTO transactions_new SELECT * FROM transactions;
+            DROP TABLE transactions;
+            ALTER TABLE transactions_new RENAME TO transactions;
+            CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
+            CREATE INDEX IF NOT EXISTS idx_tx_source ON transactions(source);
+            CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category);
+        """)
+        print("[OK] 数据库已升级：支持自定义银行来源", file=sys.stderr)
+
     db.executescript("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +164,7 @@ def init_db():
             category TEXT NOT NULL DEFAULT '其他',
             merchant TEXT DEFAULT '',
             product TEXT DEFAULT '',
-            source TEXT NOT NULL CHECK(source IN ('wechat','alipay','boc')),
+            source TEXT NOT NULL,
             payment_method TEXT DEFAULT '',
             tx_id TEXT DEFAULT '',
             remark TEXT DEFAULT '',
@@ -398,32 +433,241 @@ def parse_amount(val):
         return 0.0
 
 
-def detect_format(filepath):
-    """Detect source format: 'wechat', 'alipay', 'boc', or None."""
+def detect_format(filepath, custom_source=None):
+    """Detect source format. Returns (format, source_name)."""
     name = filepath.name.lower()
     path_str = str(filepath).lower()
 
+    if custom_source:
+        if name.endswith(".csv"):
+            return ("generic_csv", custom_source)
+        if name.endswith(".xlsx"):
+            return ("generic_xlsx", custom_source)
+        if name.endswith(".pdf"):
+            return ("boc_pdf", custom_source)
+
     if "wechat" in path_str or "微信" in path_str:
         if name.endswith(".xlsx"):
-            return "wechat"
+            return ("wechat", "wechat")
     if "alipay" in path_str or "支付宝" in path_str:
         if name.endswith(".csv"):
-            return "alipay"
+            return ("alipay", "alipay")
     if "boc" in path_str or "中国银行" in path_str or "中国银行" in str(filepath.parent).lower():
         if name.endswith(".pdf"):
-            return "boc_pdf"
+            return ("boc_pdf", "boc")
         if name.endswith(".xlsx"):
-            return "boc_xlsx"
+            return ("boc_xlsx", "boc")
 
     # Fallback: try by extension
     if name.endswith(".xlsx"):
-        return "wechat"  # most likely
+        return ("generic_xlsx", "unknown")
     if name.endswith(".csv"):
-        return "alipay"
+        return ("generic_csv", "unknown")
     if name.endswith(".pdf"):
-        return "boc_pdf"
+        return ("boc_pdf", "unknown")
 
+    return (None, None)
+
+
+# ── Generic CSV Parser ──
+
+def _try_parse_date(val):
+    """Try to parse a date value from various formats."""
+    from datetime import datetime as dt
+    if isinstance(val, (int, float)):
+        return excel_serial_to_date(val)[:10]
+    val = str(val).strip()
+    formats = [
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y", "%d/%m/%Y",
+    ]
+    for fmt in formats:
+        try:
+            return dt.strptime(val, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # Try regex: extract YYYY-MM-DD
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", val)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return val[:10] if len(val) >= 10 else val
+
+
+def _find_column(headers, candidates):
+    """Find column index matching candidate names."""
+    for i, h in enumerate(headers):
+        h_clean = str(h).strip().lower()
+        for c in candidates:
+            if c in h_clean:
+                return i
     return None
+
+
+def parse_generic_csv(filepath, source_name):
+    """Parse a generic CSV file with auto column detection."""
+    encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"]
+    text = None
+    for enc in encodings:
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                text = f.read()
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    if text is None:
+        return [], "无法识别编码"
+
+    # Find a likely header row (needs >= 2 column keywords to avoid metadata)
+    lines = text.strip().split("\n")
+    header_kws = ["日期", "时间", "金额", "交易", "摘要", "商户", "对方", "date", "amount"]
+    header_idx = 0
+    best_score = 0
+    for i, line in enumerate(lines[:50]):
+        score = sum(1 for kw in header_kws if kw in line)
+        if score > best_score:
+            best_score = score
+            header_idx = i
+    if best_score < 2:
+        return [], f"无法找到表头行（含足够列关键词），前几行: {lines[:5]}"
+
+    reader = csv.reader(StringIO("\n".join(lines[header_idx:])))
+    headers = next(reader)
+    headers = [str(h).strip() for h in headers]
+
+    # Detect columns
+    date_col = _find_column(headers, ["日期", "交易时间", "记账日期", "date", "time", "交易日期"])
+    amount_col = _find_column(headers, ["金额", "交易金额", "amount", "发生额"])
+    merchant_col = _find_column(headers, ["商户", "对方", "交易对方", "摘要", "merchant", "描述", "商品", "附言"])
+    type_col = _find_column(headers, ["收/支", "收支", "借贷", "方向", "类型", "type"])
+    txid_col = _find_column(headers, ["单号", "订单号", "交易单号", "流水号", "id"])
+
+    if date_col is None or amount_col is None:
+        return [], f"无法自动识别列。检测到列: {', '.join(headers[:10])}"
+
+    txs = []
+    for row in reader:
+        try:
+            if not row or len(row) <= max(date_col, amount_col):
+                continue
+            date_str = _try_parse_date(row[date_col])
+            amount = parse_amount(row[amount_col])
+
+            if amount == 0.0:
+                continue
+
+            merchant = str(row[merchant_col]) if merchant_col is not None and merchant_col < len(row) else ""
+            tx_id = str(row[txid_col]) if txid_col is not None and txid_col < len(row) else ""
+
+            # Detect type
+            if type_col is not None and type_col < len(row):
+                type_str = str(row[type_col]).strip()
+                if type_str in ("支出", "借", "出", "expense", "debit", "-"):
+                    tx_type = "expense"
+                elif type_str in ("收入", "贷", "入", "income", "credit", "+"):
+                    tx_type = "income"
+                else:
+                    tx_type = "expense" if amount < 0 else "income"
+            else:
+                tx_type = "expense" if amount < 0 else "income"
+
+            amount = abs(amount)
+            category = categorize(merchant, "", tx_type, source_name)
+
+            txs.append({
+                "date": date_str,
+                "amount": amount,
+                "type": tx_type,
+                "category": category,
+                "merchant": merchant,
+                "product": "",
+                "source": source_name,
+                "payment_method": "",
+                "tx_id": tx_id,
+                "remark": "",
+            })
+        except (ValueError, IndexError):
+            continue
+
+    return txs, None
+
+
+def parse_generic_xlsx(filepath, source_name):
+    """Parse a generic xlsx file with auto column detection."""
+    import openpyxl
+    wb = openpyxl.load_workbook(filepath)
+    ws = wb.active
+
+    # Find header
+    header_row = None
+    data_start = 0
+    for i, row in enumerate(ws.iter_rows(max_row=50, values_only=True)):
+        row_str = " ".join(str(c) for c in row if c)
+        if any(kw in row_str for kw in ["日期", "金额", "交易", "摘要", "商户", "对方"]):
+            header_row = [str(c).strip() if c else "" for c in row]
+            data_start = i + 1
+            break
+
+    if header_row is None:
+        wb.close()
+        return [], "无法找到表头"
+
+    date_col = _find_column(header_row, ["日期", "交易时间", "记账日期", "date", "time", "交易日期"])
+    amount_col = _find_column(header_row, ["金额", "交易金额", "amount", "发生额"])
+    merchant_col = _find_column(header_row, ["商户", "对方", "交易对方", "摘要", "merchant", "描述", "商品", "附言"])
+    type_col = _find_column(header_row, ["收/支", "收支", "借贷", "方向", "类型", "type"])
+    txid_col = _find_column(header_row, ["单号", "订单号", "交易单号", "流水号", "id"])
+
+    if date_col is None or amount_col is None:
+        wb.close()
+        return [], f"无法自动识别列。检测到: {', '.join(header_row[:10])}"
+
+    txs = []
+    for row in ws.iter_rows(min_row=data_start + 1, values_only=True):
+        try:
+            if not row or len(row) <= max(date_col, amount_col):
+                continue
+            date_str = _try_parse_date(row[date_col])
+            amount = parse_amount(row[amount_col])
+
+            if amount == 0.0:
+                continue
+
+            merchant = str(row[merchant_col]) if merchant_col is not None and merchant_col < len(row) else ""
+            tx_id = str(row[txid_col]) if txid_col is not None and txid_col < len(row) else ""
+
+            if type_col is not None and type_col < len(row):
+                type_str = str(row[type_col]).strip()
+                if type_str in ("支出", "借", "出", "expense", "debit", "-"):
+                    tx_type = "expense"
+                elif type_str in ("收入", "贷", "入", "income", "credit", "+"):
+                    tx_type = "income"
+                else:
+                    tx_type = "expense" if amount < 0 else "income"
+            else:
+                tx_type = "expense" if amount < 0 else "income"
+
+            amount = abs(amount)
+            category = categorize(merchant, "", tx_type, source_name)
+
+            txs.append({
+                "date": date_str,
+                "amount": amount,
+                "type": tx_type,
+                "category": category,
+                "merchant": merchant,
+                "product": "",
+                "source": source_name,
+                "payment_method": "",
+                "tx_id": tx_id,
+                "remark": "",
+            })
+        except (ValueError, IndexError):
+            continue
+
+    wb.close()
+    return txs, None
 
 
 # ── WeChat Parser ──
@@ -706,9 +950,9 @@ def parse_boc_xlsx(filepath):
     return txs, None
 
 
-def parse_file(filepath, password=None):
+def parse_file(filepath, password=None, custom_source=None):
     """Parse a single file, auto-detecting format. Returns (txs, error)."""
-    fmt = detect_format(filepath)
+    fmt, source_name = detect_format(filepath, custom_source)
 
     if fmt == "wechat":
         return parse_wechat(filepath)
@@ -718,16 +962,12 @@ def parse_file(filepath, password=None):
         return parse_boc_pdf(filepath, password)
     elif fmt == "boc_xlsx":
         return parse_boc_xlsx(filepath)
+    elif fmt == "generic_csv":
+        return parse_generic_csv(filepath, source_name)
+    elif fmt == "generic_xlsx":
+        return parse_generic_xlsx(filepath, source_name)
     else:
-        # Try extensions as last resort
-        if filepath.suffix.lower() == ".csv":
-            return parse_alipay(filepath)
-        elif filepath.suffix.lower() == ".xlsx":
-            return parse_wechat(filepath)
-        elif filepath.suffix.lower() == ".pdf":
-            return parse_boc_pdf(filepath, password)
-        else:
-            return [], f"无法识别文件格式: {filepath}"
+        return [], f"无法识别文件格式: {filepath}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1424,6 +1664,7 @@ def add_rule(category, keyword):
     rules = load_rules()
     if category not in rules:
         print(f"分类 '{category}' 不存在，可用分类: {', '.join(rules.keys())}")
+        print(f"提示: bill rules add-category {category}  可创建新分类")
         return
     if keyword in rules[category]:
         print(f"关键词 '{keyword}' 已存在于分类 '{category}'")
@@ -1432,6 +1673,25 @@ def add_rule(category, keyword):
     save_rules(rules)
     print(f"已添加: {category} ← '{keyword}'")
     print(f"重新分类已有交易: {recategorize_all()} 条交易已更新")
+
+
+def add_category(name):
+    """Create a new custom category."""
+    rules = load_rules()
+    if name in rules:
+        print(f"分类 '{name}' 已存在")
+        return
+    # Insert before "其他"
+    keys = list(rules.keys())
+    other_idx = keys.index("其他") if "其他" in keys else len(keys)
+    new_rules = {}
+    for i, (k, v) in enumerate(rules.items()):
+        if i == other_idx:
+            new_rules[name] = []
+        new_rules[k] = v
+    save_rules(new_rules)
+    print(f"已创建分类: {name}")
+    print(f"添加关键词: bill rules add {name} <关键词>")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1449,7 +1709,8 @@ def cmd_import(args):
             continue
 
         print(f"正在解析: {path.name} ... ", end="", flush=True)
-        txs, error = parse_file(path, password=args.password)
+        txs, error = parse_file(path, password=args.password,
+                                custom_source=args.source)
 
         if error:
             print(f"[ERROR] {error}", file=sys.stderr)
@@ -1623,11 +1884,10 @@ def cmd_edit(args):
 
 
 def cmd_rules(args):
-    if args.add:
-        if len(args.add) < 2:
-            print("用法: bill rules add <分类> <关键词>")
-            return
-        add_rule(args.add[0], args.add[1])
+    if args.rules_action == "add":
+        add_rule(args.category, args.keyword)
+    elif args.rules_action == "add-category":
+        add_category(args.name)
     else:
         show_rules()
 
@@ -1662,6 +1922,7 @@ def main():
         epilog="示例: bill import 微信.xlsx 支付宝.csv 中行.pdf --password 524531")
     p_import.add_argument("files", nargs="+", metavar="文件", help="一个或多个账单文件")
     p_import.add_argument("--password", "-p", help="PDF 密码（中国银行对账单需要）")
+    p_import.add_argument("--source", "-s", help="自定义来源名称（覆盖自动检测）")
     p_import.set_defaults(func=cmd_import)
 
     # report
@@ -1692,8 +1953,7 @@ def main():
     p_query.add_argument("--max", type=float, metavar="N", help="最高金额")
     p_query.add_argument("--type", "-t", choices=["expense", "income", "neutral"],
                          help="交易类型: expense/income/neutral")
-    p_query.add_argument("--source", "-s", choices=["wechat", "alipay", "boc"],
-                         help="来源平台")
+    p_query.add_argument("--source", "-s", help="来源平台（wechat/alipay/boc/自定义）")
     p_query.add_argument("--category", "-c", metavar="分类名", help="交易分类")
     p_query.add_argument("--keyword", "-k", metavar="关键词", help="模糊搜索商户/商品/备注")
     p_query.add_argument("--show-dup", action="store_true", help="包含已去重的重复记录")
@@ -1709,9 +1969,13 @@ def main():
 
     # rules
     p_rules = sub.add_parser("rules", help="查看/编辑分类关键词规则",
-        epilog="示例: bill rules | bill rules add 餐饮美食 新餐厅名")
-    p_rules.add_argument("add", nargs="*", metavar="ARGS",
-                         help="添加: bill rules add <分类> <关键词>")
+        epilog="示例: bill rules | bill rules add 餐饮美食 新餐厅名 | bill rules add-category 宠物")
+    rules_sub = p_rules.add_subparsers(dest="rules_action")
+    p_add_kw = rules_sub.add_parser("add", help="添加关键词到分类")
+    p_add_kw.add_argument("category", help="分类名")
+    p_add_kw.add_argument("keyword", help="关键词")
+    p_add_cat = rules_sub.add_parser("add-category", help="创建新分类")
+    p_add_cat.add_argument("name", help="新分类名称")
     p_rules.set_defaults(func=cmd_rules)
 
     # export-guide

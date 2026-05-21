@@ -69,7 +69,7 @@ cd .. && rm -rf bill/
 ### import — 导入账单
 
 ```bash
-bill import <文件...> [--password PASSWORD]
+bill import <文件...> [--password PASSWORD] [--source NAME]
 ```
 
 **参数**
@@ -77,7 +77,8 @@ bill import <文件...> [--password PASSWORD]
 | 参数 | 说明 |
 |------|------|
 | `文件` | 一个或多个账单文件路径 |
-| `--password, -p` | 中国银行 PDF 密码 |
+| `--password, -p` | PDF 密码 |
+| `--source, -s` | 自定义来源名称（覆盖自动检测，用于非微信/支付宝/中行的银行） |
 
 **示例**
 
@@ -93,6 +94,10 @@ bill import 中行.pdf -p 524531
 
 # 一次性导入所有来源
 bill import 微信.xlsx 支付宝.csv 中行.pdf -p 524531
+
+# 自定义银行（自动检测 CSV 列）
+bill import 招商银行.csv --source 招商银行
+bill import 工商银行.xlsx -s 工商银行
 ```
 
 **行为**
@@ -263,7 +268,9 @@ bill edit 42 -c 餐饮美食
 ### rules — 管理规则
 
 ```bash
-bill rules [add <分类> <关键词>]
+bill rules
+bill rules add <分类> <关键词>
+bill rules add-category <新分类名>
 ```
 
 **示例**
@@ -275,6 +282,10 @@ bill rules
 # 添加关键词（自动重分类全部历史）
 bill rules add 餐饮美食 新餐厅名
 bill rules add 科技消费 ChatGPT
+
+# 创建自定义分类
+bill rules add-category 宠物
+bill rules add 宠物 猫粮
 ```
 
 规则保存在 `rules.json`，也可手动编辑。修改后重新运行 `bill rules add` 或删除 `rules.json` 重建默认规则。
