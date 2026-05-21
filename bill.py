@@ -294,18 +294,38 @@ def get_daily_trend(month):
     return [dict(r) for r in rows]
 
 
-def get_monthly_trend(months=6):
-    """Get expense totals by category for the last N months."""
+def get_monthly_trend(months=6, from_date=None, to_date=None):
+    """Get expense totals by category. Use date range if provided, else last N months."""
     db = get_db()
-    rows = db.execute(
-        """SELECT strftime('%Y-%m', date) as month,
-                 category,
-                 SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) as expense
-           FROM transactions
-           WHERE is_duplicate = 0 AND type = 'expense'
-           GROUP BY month, category
-           ORDER BY month, expense DESC"""
-    ).fetchall()
+    if from_date or to_date:
+        conditions = "is_duplicate = 0 AND type = 'expense'"
+        params = []
+        if from_date:
+            conditions += " AND date >= ?"
+            params.append(from_date)
+        if to_date:
+            conditions += " AND date <= ?"
+            params.append(to_date + "-31")  # cover full month
+        rows = db.execute(
+            f"""SELECT strftime('%Y-%m', date) as month,
+                       category,
+                       SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) as expense
+               FROM transactions
+               WHERE {conditions}
+               GROUP BY month, category
+               ORDER BY month, expense DESC""",
+            params
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT strftime('%Y-%m', date) as month,
+                     category,
+                     SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) as expense
+               FROM transactions
+               WHERE is_duplicate = 0 AND type = 'expense'
+               GROUP BY month, category
+               ORDER BY month, expense DESC"""
+        ).fetchall()
     db.close()
     return [dict(r) for r in rows]
 
@@ -1142,15 +1162,26 @@ def terminal_report(month):
     print()
 
 
-def terminal_trend(months=6):
-    """Print 6-month expense trend by category."""
+def terminal_trend(months=6, from_date=None, to_date=None):
+    """Print expense trend by category."""
     all_months = get_available_months()
     if not all_months:
         print("暂无数据")
         return
 
-    recent = all_months[-months:]
-    trend_data = get_monthly_trend(months)
+    if from_date or to_date:
+        trend_data = get_monthly_trend(from_date=from_date, to_date=to_date)
+        # Filter available months to the range
+        recent = [m for m in all_months
+                  if (not from_date or m >= from_date)
+                  and (not to_date or m <= to_date)]
+        if months:
+            recent = recent[-months:] if len(recent) > months else recent
+        label = f"{recent[0]} ~ {recent[-1]}" if recent else "指定范围"
+    else:
+        recent = all_months[-months:]
+        trend_data = get_monthly_trend(months=months)
+        label = f"近{len(recent)}月"
 
     # Aggregate by month and category
     month_cat = defaultdict(lambda: defaultdict(float))
@@ -1169,7 +1200,7 @@ def terminal_trend(months=6):
 
     print()
     print("═" * 60)
-    print("  近{}月支出趋势（分类别）".format(len(recent)))
+    print(f"  {label}支出趋势（分类别）")
     print("═" * 60)
 
     # Header
@@ -1780,14 +1811,23 @@ def cmd_report(args):
 
 def cmd_trend(args):
     init_db()
-    terminal_trend(args.months)
-    # Also show current month category breakdown
+    terminal_trend(months=args.months, from_date=args.from_date, to_date=args.to_date)
+    # Show category breakdown for the last month in range (or latest if no range)
     available = get_available_months()
     if available:
+        if args.to_date and args.to_date in available:
+            show_month = args.to_date
+        elif args.from_date:
+            # Find last month within range
+            in_range = [m for m in available if m >= args.from_date
+                        and (not args.to_date or m <= args.to_date)]
+            show_month = in_range[-1] if in_range else available[-1]
+        else:
+            show_month = available[-1]
         print(f"\n{'═' * 60}")
-        print(f"  {available[-1]} 分类支出明细")
+        print(f"  {show_month} 分类支出明细")
         print(f"{'═' * 60}")
-        categories = get_category_breakdown(available[-1])
+        categories = get_category_breakdown(show_month)
         total_expense = sum(c["expense"] for c in categories)
         if total_expense > 0:
             for cat in categories:
@@ -1980,10 +2020,14 @@ def main():
     p_report.set_defaults(func=cmd_report)
 
     # trend
-    p_trend = sub.add_parser("trend", help="查看近N月分类支出趋势",
-        epilog="示例: bill trend | bill trend -m 12")
+    p_trend = sub.add_parser("trend", help="查看分类支出趋势",
+        epilog="示例: bill trend | bill trend -m 12 | bill trend --from 2025-04 --to 2025-05")
     p_trend.add_argument("-m", "--months", type=int, default=6,
-                         help="显示最近几个月 (默认: 6)")
+                         help="显示最近几个月 (默认: 6，与--from/--to 共用时限制条数)")
+    p_trend.add_argument("--from", dest="from_date", metavar="YYYY-MM",
+                         help="起始月份")
+    p_trend.add_argument("--to", dest="to_date", metavar="YYYY-MM",
+                         help="结束月份")
     p_trend.set_defaults(func=cmd_trend)
 
     # query
