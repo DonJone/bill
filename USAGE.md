@@ -7,6 +7,7 @@
 - [命令详解](#命令详解)
   - [import — 导入账单](#import--导入账单)
   - [report — 生成报告](#report--生成报告)
+  - [daily — 每日分析](#daily--每日分析)
   - [trend — 月度趋势](#trend--月度趋势)
   - [query — 检索明细](#query--检索明细)
   - [edit — 修正分类](#edit--修正分类)
@@ -162,7 +163,51 @@ bill report 2026-05 --html --no-open  # 生成但不打开
 
 ---
 
+### daily — 每日分析
+
+```bash
+bill daily [YYYY-MM]
+```
+
+**参数**
+
+| 参数 | 说明 |
+|------|------|
+| `YYYY-MM` | 指定月份，省略则为最新月 |
+
+**示例**
+
+```bash
+bill daily             # 当月
+bill daily 2026-04     # 指定月份
+```
+
+**输出**：日均/中位支出、最高/最低单日、工作日 vs 周末日均对比、每日收支明细表（含周几）。
+
+---
+
 ### trend — 月度趋势
+
+```bash
+bill trend [-m N] [--from YYYY-MM] [--to YYYY-MM]
+```
+
+**参数**
+
+| 参数 | 说明 |
+|------|------|
+| `-m, --months N` | 显示最近 N 个月（默认 6） |
+| `--from YYYY-MM` | 起始月份 |
+| `--to YYYY-MM` | 结束月份 |
+
+**示例**
+
+```bash
+bill trend                    # 近 6 月
+bill trend -m 12              # 近 12 月
+bill trend --from 2025-04 --to 2025-06   # 指定范围
+bill trend --from 2025-04 -m 6           # 从4月起最多6个月
+```
 
 ```bash
 bill trend [-m N]

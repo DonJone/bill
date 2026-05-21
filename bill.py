@@ -1809,6 +1809,97 @@ def cmd_report(args):
         terminal_report(month)
 
 
+def terminal_daily(month):
+    """Print daily spending analysis for a month."""
+    db = get_db()
+    rows = db.execute(
+        """SELECT date,
+                 SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) as expense,
+                 SUM(CASE WHEN type='income' THEN amount ELSE 0 END) as income,
+                 COUNT(CASE WHEN type='expense' THEN 1 END) as expense_cnt,
+                 COUNT(CASE WHEN type='income' THEN 1 END) as income_cnt
+           FROM transactions
+           WHERE strftime('%Y-%m', date) = ? AND is_duplicate = 0
+             AND type != 'neutral'
+           GROUP BY date ORDER BY date""",
+        (month,)
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        print(f"{month} 无数据")
+        return
+
+    daily_data = [dict(r) for r in rows]
+    expenses = [d["expense"] for d in daily_data if d["expense"] > 0]
+    incomes = [d["income"] for d in daily_data if d["income"] > 0]
+    total_expense = sum(expenses)
+    total_income = sum(incomes)
+    active_days = len([d for d in daily_data if d["expense"] > 0 or d["income"] > 0])
+    avg_expense = total_expense / len(daily_data) if daily_data else 0
+    med_expense = sorted(expenses)[len(expenses)//2] if expenses else 0
+
+    # Weekday/weekend split
+    weekday_exp = 0
+    weekend_exp = 0
+    weekday_days = 0
+    weekend_days = 0
+    for d in daily_data:
+        dt = datetime.strptime(d["date"], "%Y-%m-%d")
+        if dt.weekday() < 5:
+            weekday_exp += d["expense"]
+            if d["expense"] > 0 or d["income"] > 0:
+                weekday_days += 1
+        else:
+            weekend_exp += d["expense"]
+            if d["expense"] > 0 or d["income"] > 0:
+                weekend_days += 1
+
+    print()
+    print("═" * 62)
+    print(f"  {month} 每日消费分析")
+    print("═" * 62)
+    print(f"  日均支出: ¥{avg_expense:,.2f}    日中位支出: ¥{med_expense:,.2f}")
+    print(f"  最高单日: ¥{max(expenses):,.2f}    最低单日: ¥{min(expenses):,.2f}" if expenses else "")
+    if weekday_days > 0 and weekend_days > 0:
+        wd_avg = weekday_exp / weekday_days
+        we_avg = weekend_exp / weekend_days
+        print(f"  工作日日均: ¥{wd_avg:,.2f} ({weekday_days}天)  周末日均: ¥{we_avg:,.2f} ({weekend_days}天)")
+    print("═" * 62)
+
+    # Day-by-day table
+    weekdays_cn = ["一", "二", "三", "四", "五", "六", "日"]
+    print(f"  {'日期':<12} {'周':<4} {'支出':>9} {'收入':>9} {'净额':>9} {'笔数':>5}")
+    print(f"  {'-' * 50}")
+    for d in daily_data:
+        if d["expense"] == 0 and d["income"] == 0:
+            continue
+        dt = datetime.strptime(d["date"], "%Y-%m-%d")
+        wday = weekdays_cn[dt.weekday()]
+        net = d["income"] - d["expense"]
+        cnt = d["expense_cnt"] + d["income_cnt"]
+        wday_tag = f"[{wday}]" if dt.weekday() >= 5 else f" {wday} "
+        print(f"  {d['date']:<12} {wday_tag:<4} ¥{d['expense']:>8,.2f} ¥{d['income']:>8,.2f} ¥{net:>8,.2f} {cnt:>5}")
+    print(f"  {'-' * 50}")
+    print(f"  {'合计':<12} {'':<4} ¥{total_expense:>8,.2f} ¥{total_income:>8,.2f} ¥{total_income - total_expense:>8,.2f}")
+    print()
+
+
+def cmd_daily(args):
+    init_db()
+    month = args.month
+    if month is None:
+        available = get_available_months()
+        if not available:
+            print("暂无数据", file=sys.stderr)
+            sys.exit(1)
+        month = available[-1]
+    if month not in get_available_months():
+        print(f"月份 {month} 无数据", file=sys.stderr)
+        sys.exit(1)
+    terminal_daily(month)
+
+
 def cmd_trend(args):
     init_db()
     terminal_trend(months=args.months, from_date=args.from_date, to_date=args.to_date)
@@ -1990,13 +2081,17 @@ def main():
   bill import 微信账单.xlsx 支付宝.csv 中行.pdf -p 123456
   bill report                        # 当月终端报告
   bill report 2026-05 --html         # 生成HTML并在浏览器打开
+  bill daily                         # 当月每日消费分析
+  bill daily 2026-04                 # 指定月份每日分析
   bill trend -m 12                   # 近12月趋势
+  bill trend --from 2025-04 --to 2025-06  # 自定义日期范围
   bill query -m 2026-05 -c 餐饮美食   # 检索5月餐饮支出
-  bill query -m 2026-05 --min 100    # 5月>=100元的交易
+  bill query -m 2026-05 --min 100 --sort amount  # 按金额排序
   bill query -k 美团 | sort -t$'\t' -k4 -rn  # 管道到sort排序
   bill edit 42 -c 餐饮美食            # 把ID=42的交易改为餐饮美食
   bill rules                         # 查看分类规则
   bill rules add 餐饮美食 新关键词     # 添加分类关键词
+  bill rules add-category 宠物        # 创建新分类
   bill export-guide                  # 各平台账单导出教学
 """,
     )
@@ -2018,6 +2113,13 @@ def main():
     p_report.add_argument("--html", action="store_true", help="生成交互式HTML报告（含图表）")
     p_report.add_argument("--no-open", action="store_true", help="不自动用浏览器打开HTML")
     p_report.set_defaults(func=cmd_report)
+
+    # daily
+    p_daily = sub.add_parser("daily", help="查看每日消费分析",
+        epilog="示例: bill daily | bill daily 2026-05")
+    p_daily.add_argument("month", nargs="?", metavar="YYYY-MM",
+                         help="指定月份，默认最新")
+    p_daily.set_defaults(func=cmd_daily)
 
     # trend
     p_trend = sub.add_parser("trend", help="查看分类支出趋势",
