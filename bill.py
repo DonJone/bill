@@ -1845,18 +1845,57 @@ def cmd_query(args):
                 total += t["amount"]
         print(f"# {len(txs)} records | expense_total={total:.2f}", file=sys.stderr)
     else:
-        w = 100
-        print(f"\n{'─' * w}")
-        print(f"  {'ID':<6} {'日期':<12} {'类型':<6} {'分类':<10} {'金额':>8} {'商户':<22} {'来源':<8}")
-        print(f"{'─' * w}")
+        def _dwidth(s):
+            """Display width: CJK chars = 2, ASCII = 1."""
+            w = 0
+            for ch in str(s):
+                cp = ord(ch)
+                if cp > 0x2000:  # CJK, fullwidth, etc
+                    w += 2
+                else:
+                    w += 1
+            return w
+
+        def _pad(s, width):
+            """Pad string to target display width, handling CJK."""
+            s = str(s)
+            cur = _dwidth(s)
+            if cur >= width:
+                return s
+            return s + ' ' * (width - cur)
+
+        # Fixed-width fields: use generous columns with CJK-aware padding
+        col_id = 5
+        col_date = 12
+        col_type = 6
+        col_cat = 12
+        col_amt = 12
+        col_merc = 32
+        col_src = 10
+
+        sep = "  "
+        header = (_pad("ID", col_id) + sep + _pad("日期", col_date) + sep +
+                  _pad("类型", col_type) + sep + _pad("分类", col_cat) + sep +
+                  _pad("金额", col_amt) + sep + _pad("商户", col_merc) + sep +
+                  _pad("来源", col_src))
+        line_w = _dwidth(header)
+        print(f"\n{'─' * line_w}")
+        print(f"  {header}")
+        print(f"{'─' * line_w}")
         total = 0
         for t in txs:
             type_str = {"expense": "支出", "income": "收入", "neutral": "中性"}.get(t["type"], t["type"])
+            amt = f"¥{t['amount']:,.2f}"
+            merc = t['merchant'][:28]
+            col = (_pad(str(t['id']), col_id) + sep + _pad(t['date'], col_date) + sep +
+                   _pad(type_str, col_type) + sep + _pad(t['category'], col_cat) + sep +
+                   _pad(amt, col_amt) + sep + _pad(merc, col_merc) + sep +
+                   _pad(t['source'], col_src))
             dup_mark = " *" if t["is_duplicate"] else ""
-            print(f"  {t['id']:<6} {t['date']:<12} {type_str:<6} {t['category']:<10} ¥{t['amount']:>7,.2f} {t['merchant'][:22]:<22} {t['source']:<8}{dup_mark}")
+            print(f"  {col}{dup_mark}")
             if t["type"] == "expense":
                 total += t["amount"]
-        print(f"{'─' * w}")
+        print(f"{'─' * line_w}")
         print(f"  共 {len(txs)} 笔 | 支出合计: ¥{total:,.2f}")
         print()
 
