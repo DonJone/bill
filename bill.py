@@ -1829,8 +1829,14 @@ def cmd_query(args):
         print("提示: bill query -k <关键词>  或  bill query -c <分类>", file=sys.stderr)
         sys.exit(1)
 
-    # Sort by date desc
-    txs.sort(key=lambda x: x["date"], reverse=True)
+    # Sort
+    sort_col = args.sort or "date"
+    reverse = sort_col.endswith("-desc") or not sort_col.endswith("-asc")
+    sort_col = sort_col.replace("-desc", "").replace("-asc", "")
+    if sort_col == "amount":
+        txs.sort(key=lambda x: x["amount"], reverse=reverse)
+    else:
+        txs.sort(key=lambda x: x["date"], reverse=reverse)
 
     plain = args.plain or not sys.stdout.isatty()
 
@@ -1997,6 +2003,9 @@ def main():
     p_query.add_argument("--keyword", "-k", metavar="关键词", help="模糊搜索商户/商品/备注")
     p_query.add_argument("--show-dup", action="store_true", help="包含已去重的重复记录")
     p_query.add_argument("--plain", action="store_true", help="强制TSV输出（管道时自动启用）")
+    p_query.add_argument("--sort", choices=["date", "date-asc", "date-desc",
+                         "amount", "amount-asc", "amount-desc"],
+                         default="date", help="排序方式 (默认: date 即日期从新到旧)")
     p_query.set_defaults(func=cmd_query)
 
     # edit
